@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+# 1. 动态判断 /boot 是否为独立分区，并获取 GRUB search 应指向的 UUID
+BOOT_UUID=$(grub-probe --target=fs_uuid /boot)
+ROOT_UUID=$(grub-probe --target=fs_uuid /)
+
+# 如果 /boot 是独立分区，GRUB 加载内核时的相对路径不带 /boot
+# 如果 /boot 和 / 在同一个分区，相对路径需要带 /boot
+if [ "$BOOT_UUID" = "$ROOT_UUID" ]; then
+    BOOT_REL_PATH="/boot"
+else
+    BOOT_REL_PATH=""
+fi
+
+# 2. 动态探测 /boot 下最新的内核版本（排除 rescue 和 .old 备份）
+VMLINUZ_FILE=$(find /boot -maxdepth 1 -name 'vmlinuz-*' ! -name '*rescue*' ! -name '*.old' | sort -V | tail -n 1)
+
+if [ -z "$VMLINUZ_FILE" ]; then
+    exit 0
+fi
+
+KERNEL_VERSION=$(basename "$VMLINUZ_FILE" | sed 's/^vmlinuz-//')
+
+# 匹配对应的 initrd 文件名
+if [ -f "/boot/initrd.img-${KERNEL_VERSION}" ]; then
+    INITRD_NAME="initrd.img-${KERNEL_VERSION}"
+else
+    INITRD_NAME="initrd.img"
+fi
+
+# 3. 动态输出 GRUB 菜单项
+cat << EOF
+menuentry 'Console tty1' --class terminal --class gnu-linux --class os {
+	recordfail
+	load_video
+	insmod gzio
+	insmod part_gpt
+	insmod ext2
+	search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+	linux	${BOOT_REL_PATH}/vmlinuz-${KERNEL_VERSION} root=UUID=${ROOT_UUID} ro systemd.unit=multi-user.target quiet splash
+	initrd	${BOOT_REL_PATH}/${INITRD_NAME}
+}
+EOF

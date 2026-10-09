@@ -1,0 +1,231 @@
+#!/bin/sh
+set -e
+
+# update-grub 执行时会先把配置写入临时文件 /boot/grub/grub.cfg.new
+# 在 99 号脚本这里，所有前置项已生成完毕，动态读取系统信息完成菜单标题清洗（发行版名称 + 主版本号）与旧内核去重
+TARGET="${1:-/boot/grub/grub.cfg.new}"
+
+if [ -f "$TARGET" ]; then
+    python3 - "$TARGET" << 'PYEOF'
+import os
+import re
+import stat
+import subprocess
+import sys
+
+target = sys.argv[1]
+with open(target, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
+
+def clean_distro_name(raw):
+    s = raw.strip().strip('"').strip("'")
+    s = re.sub(r',\s*with\s+Linux.*$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*\(on\s+/dev/[^)]+\)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*\([^)]*\)', '', s)
+    s = re.sub(r'\s*GNU/Linux\b', '', s, flags=re.IGNORECASE)
+    if s.lower().startswith('fedora linux'):
+        s = 'Fedora' + s[12:]
+    elif s.lower().startswith('manjaro linux'):
+        s = 'Manjaro'
+    return s.strip()
+
+def clean_version_num(distro, raw_ver):
+    if not raw_ver:
+        return ""
+    v = raw_ver.strip().strip('"').strip("'")
+    d = distro.lower()
+    if d == 'ubuntu':
+        parts = v.split('.')
+        if len(parts) >= 2:
+            return f"{parts[0]}.{parts[1]}"
+        return v
+    if d in ('debian', 'fedora'):
+        return v.split('.')[0]
+    return v
+
+def format_distro_version(name, version_id, raw_title=""):
+    if name:
+        dname = clean_distro_name(name)
+        dver = clean_version_num(dname, version_id)
+        if dver:
+            return f"{dname} {dver}".strip()
+        return dname
+
+    s = raw_title.strip().strip('"').strip("'")
+    s = re.sub(r',\s*with\s+Linux.*$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*\(on\s+/dev/[^)]+\)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*\([^)]*\)', '', s)
+    s = re.sub(r'\s*GNU/Linux\b', '', s, flags=re.IGNORECASE)
+    if s.lower().startswith('fedora linux'):
+        s = 'Fedora' + s[12:]
+
+    m = re.match(r'^([A-Za-z!_ -]+?)\s+(?:release\s+)?([0-9]+(?:\.[0-9]+)*)', s.strip(), flags=re.IGNORECASE)
+    if m:
+        dname = clean_distro_name(m.group(1))
+        dver = clean_version_num(dname, m.group(2))
+        if dver:
+            return f"{dname} {dver}".strip()
+        return dname
+    return clean_distro_name(s)
+
+def read_os_release(root_dir="/"):
+    for rel in ("etc/os-release", "usr/lib/os-release"):
+        p = os.path.join(root_dir, rel)
+        if os.path.isfile(p):
+            try:
+                data = {}
+                with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if '=' in line and not line.startswith('#'):
+                            k, v = line.split('=', 1)
+                            data[k.strip()] = v.strip().strip('"').strip("'")
+                name = data.get('NAME', '')
+                ver = data.get('VERSION_ID', '')
+                if name:
+                    return format_distro_version(name, ver)
+            except Exception:
+                pass
+    return None
+
+def read_distro_for_device(dev_path):
+    if not dev_path:
+        return None
+    try:
+        res = subprocess.run(
+            ["findmnt", "-rn", "-S", dev_path, "-o", "TARGET"],
+            capture_output=True, text=True, timeout=2
+        )
+        mnt = res.stdout.strip().splitlines()[0] if res.stdout.strip() else ""
+        if mnt and os.path.isdir(mnt):
+            return read_os_release(mnt)
+    except Exception:
+        pass
+    return None
+
+def read_windows_bcd_title():
+    for p in ("/boot/efi/EFI/Microsoft/Boot/BCD", "/efi/EFI/Microsoft/Boot/BCD"):
+        if os.path.isfile(p) and os.access(p, os.R_OK):
+            try:
+                with open(p, "rb") as f:
+                    raw = f.read()
+                matches = re.findall(
+                    rb'(?:W\x00i\x00n\x00d\x00o\x00w\x00s\x00(?:\x20\x00)+(?:1\x001\x00|1\x000\x00|8\x00(?:\.\x001\x00)?|7\x00|S\x00e\x00r\x00v\x00e\x00r\x00(?:\x20\x00+\d\x00\d\x00\d\x00\d\x00)?))',
+                    raw
+                )
+                if matches:
+                    return matches[0].decode('utf-16le', errors='ignore').strip()
+            except Exception:
+                pass
+    return "Windows 11"
+
+host_distro = read_os_release("/")
+win_title = read_windows_bcd_title()
+
+menu_re = re.compile(r'^([ \t]*menuentry\s+)([\'"])(.*?)\2(.*)$')
+sub_re = re.compile(r'^[ \t]*submenu\s+([\'"])(.*?)\1(.*)$')
+if_plat_re = re.compile(r'^[ \t]*if\s+\[\s*"\$grub_platform"\s*=\s*"[^"]+"\s*\];\s*then\s*$')
+
+out_lines = []
+seen_groups = set()
+in_submenu = False
+submenu_depth = 0
+brace_depth = 0
+
+i = 0
+n = len(lines)
+while i < n:
+    line = lines[i]
+    stripped = line.strip()
+
+    if stripped.startswith('#'):
+        out_lines.append(line)
+        i += 1
+        continue
+
+    if sub_re.match(line) and stripped.endswith('{'):
+        if not in_submenu:
+            in_submenu = True
+            submenu_depth = brace_depth
+        brace_depth += 1
+        out_lines.append(line)
+        i += 1
+        continue
+
+    m_menu = menu_re.match(line)
+    if m_menu and stripped.endswith('{') and not in_submenu:
+        prefix, quote, title, attrs = m_menu.group(1), m_menu.group(2), m_menu.group(3), m_menu.group(4)
+
+        entry_start_depth = brace_depth
+        block = [line]
+        brace_depth += 1
+        i += 1
+        while i < n and brace_depth > entry_start_depth:
+            bline = lines[i]
+            bstripped = bline.strip()
+            if not bstripped.startswith('#'):
+                brace_depth += len(re.findall(r'\{', bstripped)) - len(re.findall(r'\}', bstripped))
+            block.append(bline)
+            i += 1
+
+        # 1. Keep terminal / custom entries / memtest untouched
+        if '--class terminal' in attrs or 'gnulinux-terminal-' in attrs or '--class custom' in attrs or 'memtest' in title.lower():
+            out_lines.extend(block)
+            continue
+
+        # 2. UEFI -> 'UEFI'
+        if 'uefi-firmware' in attrs or '--class efi' in attrs or title in ('UEFI Firmware Settings', 'UEFI'):
+            block[0] = f"{prefix}'UEFI'{attrs}\n"
+            out_lines.extend(block)
+            continue
+
+        # 3. Windows -> dynamically read from BCD or default to 'Windows 11'
+        if '--class windows' in attrs or 'osprober-efi-' in attrs or 'osprober-chain-' in attrs or title.lower().startswith('windows'):
+            if 'windows' in seen_groups:
+                if out_lines and if_plat_re.match(out_lines[-1]) and i < n and lines[i].strip() == 'fi':
+                    out_lines.pop()
+                    i += 1
+                continue
+            seen_groups.add('windows')
+            block[0] = f"{prefix}'{win_title}'{attrs}\n"
+            out_lines.extend(block)
+            continue
+
+        # 4. Linux -> dynamically read from /etc/os-release or parse Distro + Version
+        if '--class gnu-linux' in attrs or 'gnulinux-' in attrs:
+            m_ondev = re.search(r'\(on (/dev/[^)]+)\)', title)
+            m_osprober = re.search(r"osprober-gnulinux-.*?-([0-9a-fA-F-]{8,}|[0-9a-zA-Z_-]+)'", attrs)
+            if 'osprober-gnulinux-' in attrs:
+                dev = m_ondev.group(1) if m_ondev else (m_osprober.group(1) if m_osprober else title)
+                key = f"linux:osprober:{dev}"
+                new_title = read_distro_for_device(m_ondev.group(1) if m_ondev else None) or format_distro_version("", "", title)
+            else:
+                key = "linux:host"
+                new_title = host_distro or format_distro_version("", "", title)
+
+            if key in seen_groups:
+                continue
+            seen_groups.add(key)
+            block[0] = f"{prefix}'{new_title}'{attrs}\n"
+            out_lines.extend(block)
+            continue
+
+        out_lines.extend(block)
+        continue
+
+    brace_depth += len(re.findall(r'\{', stripped)) - len(re.findall(r'\}', stripped))
+    if in_submenu and brace_depth <= submenu_depth:
+        in_submenu = False
+    out_lines.append(line)
+    i += 1
+
+if target.endswith('.new'):
+    out_lines.append("### END /etc/grub.d/99_rename_entries ###\n")
+
+tmp_target = f"{target}.tmp"
+with open(tmp_target, 'w', encoding='utf-8') as f:
+    f.writelines(out_lines)
+os.chmod(tmp_target, stat.S_IRUSR | stat.S_IWUSR)
+os.replace(tmp_target, target)
+PYEOF
+fi
